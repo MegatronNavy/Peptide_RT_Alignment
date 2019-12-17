@@ -1,0 +1,476 @@
+---
+title: "Version_1.12_diff_simulations"
+author: "Yi Zheng"
+date: "12/16/2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls(all.names = TRUE))
+library(mvtnorm)
+library(numDeriv)
+library(Matrix)
+library(ggplot2)
+library(splines)
+library(tidyverse)
+library(gganimate)
+library(kableExtra)
+```
+
+```{r read pep data, message=FALSE, warning=FALSE}
+PEP<-read_csv("ev_prefiltering.csv")
+PEP<-PEP$PEP
+anyNA(PEP)
+```
+
+```{r parameters}
+n<-100
+num_of_data <- n
+p <- 50
+num_it <- 25
+degf <- 6
+
+```
+
+
+# Simulation set up
+
+Here I use $\sqrt{(1-PEP)}$ to denoise the simulation data.
+
+
+```{r simulation set up}
+
+#set.seed(123)
+set.seed(100)
+temp <- sample(20:30,p, replace = TRUE)
+power <- runif(p,2,4)
+
+pep_sim<-matrix(sample(PEP,n*p,replace = TRUE), nrow = n, ncol = p)
+#pep_sim<-matrix(0, nrow = n, ncol = p)
+#s <- runif(num_of_data,0, 1)
+s <- rbeta(num_of_data, 8, 2)
+x<-matrix(nrow = n, ncol = p)
+y<-matrix(nrow = n, ncol = p)
+z<-matrix(nrow = n, ncol = p)
+y1<-matrix(nrow = n, ncol = p)
+x1<-matrix(nrow = n, ncol = p)
+
+#x is the reference RT
+for (i in 1:p) {
+  x[,i] <- 3*(temp[i]-10)^2*s^power[i]/100 + 10
+}
+
+prior <- array(dim = c(n,p,n))
+for (i in 1:n) {
+  for (j in 1:p) {
+    prob=rep(pep_sim[i,j]/(n-1),n)
+    prob[i]=1-pep_sim[i,j]
+    prior[i,j,]=prob
+    prob1 <- rep((1-sqrt(prob[i]))/(n-1),n)
+    prob1[i] <- sqrt(prob[i])
+    class=rmultinom(1, 1, prob1)
+    y[i,j]=t(class)%*%x[,j]+rnorm(1,mean = 0,sd=0.1)
+    z[i,j]=which(class==1)
+  }
+}
+
+# for (i in 1:(p-1)) {
+#   for (j in (i+1):p) {
+#     plot<-ggplot(data=as.data.frame(y))+geom_point(aes(x=y[,i],y=y[,j]))
+#     print(plot)
+#   }
+# }
+
+for (i in 1:p) {
+  y1[,i] <- 3*(temp[i]-10)^2*sort(s)^power[i]/100 + 10-mean(y[,i])
+  x1[,i] <- 3*(temp[i]-10)^2*s^power[i]/100 + 10-mean(y[,1])
+}
+
+
+```
+
+
+# Alignment Initialization
+
+```{r alignment 1 initialization}
+y <- scale(y, scale = F)
+
+svdx <- svd(y)
+d<-svdx$v
+
+# ggplot(data=as.data.frame(y))+geom_point(aes(x=y[,1],y=y[,2]))+geom_abline(intercept = 0, slope = d[2,1]/d[1,1])
+# ggplot(data=as.data.frame(y))+geom_point(aes(x=y[,1],y=y[,3]))+geom_abline(intercept = 0, slope = d[3,1]/d[1,1])
+# ggplot(data=as.data.frame(y))+geom_point(aes(x=y[,2],y=y[,3]))+geom_abline(intercept = 0, slope = d[3,1]/d[2,1])
+
+## plot projections of each point onto line
+proj1 <- y%*%d[,1]%*%t(d[,1])
+
+
+ak_initial<-function(fi,mu,d){
+  ak<-t(d)%*%(fi-mu)/(t(d)%*%d)
+  return(ak)
+}
+n=nrow(y)
+p=ncol(y)
+vk<-rep(1/n,n)
+mu<-colMeans(y)
+Fun<-proj1#n by p matrix representing fj(ak)
+a<-apply(Fun, 1, ak_initial, mu=mu,d=d[,1])
+
+a <- (a-min(a))/(max(a)-min(a))
+
+aini<-a
+alist<-list()
+
+#sigma<-t(replicate(n,diag(cov(y))))#should be n by p (col for each ak)
+sigma<-matrix(0.25^2,nrow = n,ncol = p)
+
+
+
+```
+
+
+# Alignment Iteration
+
+```{r alignment 2 iteration}
+Q<-function(a,fits,W,X){#f is a list of fits, is empty for first iteration
+  n=length(a)
+  p<-ncol(X)
+  Fun<-matrix(data = NA,nrow = n,ncol = p)
+  if(length(fits)==0){#first iteration
+    # mu<-colMeans(X)
+    # d<-svdx$v[,1]
+    # Fun<-t(d%*%t(a)+mu)
+    # Sigvec<-diag(cov(X))
+    # Qval=0
+    # for (k in 1:n) {
+    #   S=(t(t(X)-Fun[k,]))^2
+    #   second_term<-rep(0.5*sum(log(Sigvec)),n)
+    #   Qval<-Qval+sum(S%*%(-1/Sigvec)-second_term)
+    # }
+  }else{
+    for (j in 1:p) {
+      Fun[,j]=predict(fits[[j]],a)$y
+    }
+    Qval<-0
+    for (k in 1:n) {
+      S=W[,,k]*(t(t(X)-Fun[k,]))^2
+      #S=(t(t(X)-Fun[k,]))^2
+      Sigvec=rep(0.25^2,p)#p by 1 vector of sigma_j^2(ak)
+      second_term<-sum(W[,,k]%*%log(Sigvec)/2)
+      Qval<-Qval+sum(S%*%(-1/Sigvec))/2-second_term
+    }
+  }
+  return(-Qval)
+}
+
+
+#step2 Iteration
+#likelihood function
+plot_dat <- cbind(Fun,rep(0,n),y)
+u=0
+fits<-list()
+SMtx<-list()
+#PenMtx<-list()
+# Qval<-rep(0,num_it+1)
+# Qval[1]<--Q(a,fits,W=NA,x)#Return value of Q is the negative of Q value in EM
+# Qval1<-Qval[1]
+for (h in 1:num_it) {
+  # Qval0<-Qval1
+  W2<-array(dim = c(n,p,n))#modify the calculation
+  for (i in 1:n) {
+    for (j in 1:p) {
+      gyij<-0
+      for (k1 in 1:n) {
+        gyij<-gyij+dnorm(y[i,j],Fun[k1,j],sd = 0.25)*prior[i,j,k1]
+      }
+      for (k in 1:n) {
+        loggyijak<-log(dnorm(y[i,j],mean = Fun[k,j],sd = 0.25))
+        #gy(y_h)
+        W2[i,j,k]<-loggyijak-log(gyij)+log(prior[i,j,k])
+      }
+    }
+  }
+  W2=exp(W2)
+  if(h!=1){
+    a<-nlm(f=Q, p=a, fits=fits, W=W2, X=y,iterlim = 1)$estimate
+  }
+  #now update f and sigma and vk
+   a2<-max(a)
+   a1<-min(a)
+  weights<-t(apply(W2, 2:3, sum))
+  
+  for (j in 1:p) {
+    Dmtx<-diag(1/weights[,j])#it's the inverse of D
+    ybar<-t(W2[,j,])%*%y[,j]
+    yvalue<-Dmtx%*%ybar
+    fit <- smooth.spline(x=a, y=yvalue, w=weights[,j], df=degf)##fixed df because as iteration goes on the fit will be interplotation.
+    Fun[,j]=predict(fit,a)$y
+    fits[[j]]=fit
+  }
+  
+################################################################################  
+  for (k in 1:n) {
+    S=(t(t(y)-Fun[k,]))^2
+    #sigma[k,]=colSums(W2[,,k]*S)/colSums(W2[,,k])#p by 1 vector of sigma_j^2(ak)
+  }
+  vk<-weights/(n*p)
+  u<-u+1
+  # plot data and the principal curve for a sequence of a's
+  # plot(y[,1], y[,2], bty='n',
+  #      xlab=expression(x[1]),
+  #      ylab=expression(x[2]))
+  # legend("topleft", legend=c("Proj 1"), bty="n")
+  # points(x=Fun[,1],y=Fun[,2],col="red")
+  # 
+  # points(x=y[2,1],y=y[2,2],col="blue")
+  
+  plot_dat <- rbind(plot_dat,cbind(Fun,rep(h,n),y))
+   a<-(a-a1)/(a2-a1)
+   alist[[h]]<-a
+}
+
+```
+
+# Iteration Process In animation
+
+```{r plots of iteration process}
+plot_dat <- as.data.frame(plot_dat)
+xlim <- c(min(plot_dat$V1-1), max(plot_dat$V1)+1)
+ylim <- c(min(plot_dat$V2-1), max(plot_dat$V2)+1)
+plt <- ggplot(data = plot_dat, aes(x=V1, y=V2))+geom_point(color = "red")+scale_x_continuous(limits = xlim)+scale_y_continuous(limits = ylim)+geom_point(aes(x=V52,y=V53))
+#+geom_path(data = data.frame(x=y1[,1],y=y1[,2],aes(x=x,y=y)))
+plt + transition_states(states = V51, state_length = 0.2, transition_length = 0.2)+ggtitle('Now showing {closest_state}',
+          subtitle = 'Frame {frame} of {nframes}')
+```
+
+# S value and a value comparison
+
+```{r analysis of results: a values and s values}
+hist(a)
+hist(s)
+
+
+pt.dat <- data.frame(y1=y[,1],y2=y[,2],y3=y[,3],a=a,s=s,f1=Fun[,1],f2=Fun[,2],f3=Fun[,3])
+
+ggplot(data = pt.dat)+geom_point(aes(x=s,y=y1))+geom_point(aes(x=s,y=f1,colour="red"))
+ggplot(data = pt.dat)+geom_point(aes(x=s,y=y2))+geom_point(aes(x=s,y=f2,colour="red"))
+ggplot(data = pt.dat)+geom_point(aes(x=s,y=y3))+geom_point(aes(x=s,y=f3,colour="red"))
+
+ggplot(data = pt.dat)+geom_point(aes(x=a,y=y1))+geom_point(aes(x=a,y=f1,colour="red"))
+ggplot(data = pt.dat)+geom_point(aes(x=a,y=y2))+geom_point(aes(x=a,y=f2,colour="red"))
+ggplot(data = pt.dat)+geom_point(aes(x=a,y=y3))+geom_point(aes(x=a,y=f3,colour="red"))
+```
+
+# The effect of the model
+
+
+```{r analysis: comparison}
+updated_true <- matrix(0, nrow = nrow(y), ncol = ncol(y))
+mtx_updated <- matrix(0, nrow = nrow(y), ncol = ncol(y))
+updated_id <- matrix(0, nrow = nrow(y), ncol = ncol(y))
+for (j in 1:p) {
+  for (i in 1:n) {
+    updated_true[i,j] <- W2[i,j,z[i,j]]
+    mtx_updated[i,j] <- max(W2[i,j,])
+    updated_id[i,j] <- if(max(W2[i,j,])>0.99) which.max(W2[i,j,]) else i
+    #updated_id[i,j] <- which.max(W2[i,j,])
+  }
+}
+
+mtx_updated_true_pep <- 1-updated_true
+mtx_updated_pep <- 1-mtx_updated
+
+sum(as.numeric(pep_sim<0.01))
+sum(as.numeric(mtx_updated_true_pep<0.01))
+sum(as.numeric(mtx_updated_pep<0.01))
+```
+
+# Explanatory plots
+
+```{r analysis of results: explanatory plots}
+#new_pep <- as.numeric(mtx_updated_true_pep)
+new_pep <- as.numeric(mtx_updated_pep)
+old_pep <- as.numeric(pep_sim)
+#plot1<-ggplot(data = data.frame(new=new_pep,old=old_pep))+geom_point(aes(x=new,y=old))
+#plot1+geom_abline(slope = 1,intercept = 0)
+
+#plot1+xlim(0,0.05)+geom_abline(slope = 1,intercept = 0)
+
+id_tf<-as.numeric(z==matrix(rep(1:n,p),nrow = n))
+
+pep_dat<-data.frame(new=new_pep,old=old_pep,id_tf=id_tf, pair=rep(1:n,p))
+
+plot2<-ggplot(data = pep_dat,aes(x=new,y=old))+geom_point(aes(colour=id_tf))
+plot2+geom_abline(slope = 1,intercept = 0)
+plot2+xlim(0,0.05)+geom_abline(slope = 1,intercept = 0)
+
+
+#plot2+geom_abline(slope = 1,intercept = 0)+geom_line(aes(group=pair))
+
+#filtered <- pep_dat %>% filter(pep_dat$new<0.01)
+
+#filtered2<-pep_dat %>% filter(pep_dat$pair %in% filtered$pair)
+
+#plot2+geom_abline(slope = 1,intercept = 0)+geom_line(data=filtered2,aes(group=pair))
+
+#plot2+geom_abline(slope = 1,intercept = 0)+geom_line(data=filtered2,aes(group=pair))+xlim(0,0.05)
+
+dat_p3 <- data.frame(RT1=y[,1],RT2=y[,2], new1=new_pep[1:n], new2=new_pep[(n+1):(2*n)],old1=old_pep[1:n], old2=old_pep[(n+1):(2*n)],id=(z==matrix(rep(1:n,p),nrow = n)),ref_RT1=x1[,1],ref_RT2=x1[,2])
+ggplot(data = dat_p3)+geom_point(aes(x=RT1,y=RT2, colour=id.1))
+
+ggplot(data = dat_p3)+geom_point(aes(x=RT1,y=RT2, colour=new1<0.01))
+
+
+ggplot(data = dat_p3)+geom_point(aes(x=RT1,y=RT2, colour=id.2))
+
+ggplot(data = dat_p3)+geom_point(aes(x=RT1,y=RT2, colour=new2<0.01))
+
+ggplot(data = dat_p3)+geom_point(aes(x=RT1,y=ref_RT1, colour=new1<0.01))
+ggplot(data = dat_p3)+geom_point(aes(x=RT2,y=ref_RT2, colour=new1<0.01))
+ggplot(data = dat_p3)+geom_point(aes(x=RT1,y=ref_RT1, colour=new1<old1))
+
+```
+
+# Tables
+
+## Table 1
+
+For table 1, we see that there is 1 falsely identified peptide with pep<0.01. And the model fails identify this one.
+
+
+```{r create tables}
+# Create Tables
+
+#1. how many mislabels
+#2. how many PEP > 0.01
+
+
+#Table 1 
+
+count <- matrix(0,nrow = 2, ncol = 2)
+z_logis <- matrix(FALSE,nrow = n,ncol = p)
+
+for (i in 1:nrow(y)) {
+  for(j in 1:ncol(y)){
+    count[1,1]=count[1,1]+as.numeric((i==z[i,j])&(pep_sim[i,j]>0.01))
+    count[1,2]=count[1,2]+as.numeric((i!=z[i,j])&(pep_sim[i,j]>0.01))
+    count[2,1]=count[2,1]+as.numeric((i==z[i,j])&(pep_sim[i,j]<0.01))
+    count[2,2]=count[2,2]+as.numeric((i!=z[i,j])&(pep_sim[i,j]<0.01))
+    if(i!=z[i,j]){
+      z_logis[i,j]=TRUE
+    } 
+  }
+}
+table1 <- as.data.frame(count)
+
+rownames(table1) <- c("PEP>0.01","PEP<0.01")
+colnames(table1) <- c("True Match","False Match")
+kable(table1, "html", caption = "Table before update")
+
+id_points_1<-which((z_logis)&(pep_sim<0.01),arr.ind = TRUE)
+id_points_1
+z[id_points_1]
+updated_id[id_points_1]
+
+sum(new_pep>0.01 & old_pep<0.01)
+old_pep[new_pep>0.01 & old_pep<0.01]
+new_pep[new_pep>0.01 & old_pep<0.01]
+id.points_2<- which(mtx_updated_pep>0.01 & pep_sim<0.01,arr.ind = TRUE)
+id.points_2
+
+which(mtx_updated_true_pep>0.01 & pep_sim<0.01,arr.ind = TRUE)
+
+
+
+dat_p5 <- data.frame(RT1=y[,1],RT2=y[,id_points_1[1,2]], new1=mtx_updated_pep[,1], new2=mtx_updated_pep[,id_points_1[1,2]], ref_RT1=x1[,2],ref_RT2=x1[,id_points_1[1,2]])
+
+ggplot(data = dat_p5,aes(x=RT1,y=RT2))+geom_point()+geom_point(data = dat_p5[id_points_1[1,1],], aes(x=RT1,y=RT2), colour = "red")+geom_path(data = data.frame(x=y1[,1],y=y1[,id_points_1[1,2]]),aes(x=x,y=y))
+```
+
+## Table 2
+
+For table 2 there are two wrongly identified points. These are different from the ones in table 2
+
+
+```{r table 2}
+#Table 2 updated version of table 1
+count <- matrix(0,nrow = 2, ncol = 2)
+
+for (i in 1:nrow(y)) {
+  for(j in 1:ncol(y)){
+    count[1,1]=count[1,1]+as.numeric((updated_id[i,j]==z[i,j])&(mtx_updated_pep[i,j]>0.01))
+    count[1,2]=count[1,2]+as.numeric((updated_id[i,j]!=z[i,j])&(mtx_updated_pep[i,j]>0.01))
+    count[2,1]=count[2,1]+as.numeric((updated_id[i,j]==z[i,j])&(mtx_updated_pep[i,j]<0.01))
+    count[2,2]=count[2,2]+as.numeric((updated_id[i,j]!=z[i,j])&(mtx_updated_pep[i,j]<0.01))
+  }
+}
+table2 <- as.data.frame(count)
+rownames(table2) <- c("PEP>0.01","PEP<0.01")
+colnames(table2) <- c("True Match","False Match")
+
+kable(table2, "html", caption = "Table after update")
+
+wrongly_updated_id <- which((updated_id!=z)&(mtx_updated_pep<0.01), arr.ind = TRUE)
+wrongly_updated_id
+pep_sim[wrongly_updated_id]#pep larger than
+updated_id[wrongly_updated_id]
+mtx_updated_pep[wrongly_updated_id]
+z[wrongly_updated_id]
+
+
+dat_p4 <- data.frame(RT1=y[,2],RT2=y[,wrongly_updated_id[1,2]], new1=mtx_updated_pep[,2], new2=mtx_updated_pep[,wrongly_updated_id[1,2]], ref_RT1=x1[,2],ref_RT2=x1[,wrongly_updated_id[1,2]])
+
+ggplot(data = dat_p4,aes(x=RT1,y=RT2))+geom_point()+geom_point(data = dat_p4[wrongly_updated_id[1,1],], aes(x=RT1,y=RT2), colour = "red")+geom_path(data = data.frame(x=y1[,2],y=y1[,wrongly_updated_id[1,2]]),aes(x=x,y=y))
+
+```
+
+
+
+Improvement:
+
+1. Allow replicated id?
+
+2. Better explanation of wrongly identified points
+
+3. rownumber and peptideid relationship delve more
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
