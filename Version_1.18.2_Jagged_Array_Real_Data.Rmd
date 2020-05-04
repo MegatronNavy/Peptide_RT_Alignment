@@ -1,0 +1,388 @@
+---
+title: "Version 1.18.2"
+author: "Yi Zheng"
+date: "05/04/2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+
+
+#Resol=30
+# Alignment Iteration with sigmaj estimator
+
+```{r setup, include=FALSE}
+rm(list = ls(all.names = TRUE))
+library(mvtnorm)
+library(numDeriv)
+library(Matrix)
+library(ggplot2)
+library(splines)
+library(tidyverse)
+library(gganimate)
+library(kableExtra)
+library(slam)
+library(rbenchmark)
+library(matrixStats)
+library(missMDA)
+library(RANN)
+```
+
+```{r read pep data, message=FALSE, warning=FALSE}
+evid<-read_csv("evidence.csv")
+
+head(evid,10)
+evid_concise <- evid %>% select(Sequence, `Raw file`, `Retention time`, PEP, `Peptide ID`)
+
+evid_ready <- evid_concise %>% select(-PEP,-`Peptide ID`) %>% distinct(Sequence, `Raw file`, .keep_all = TRUE) %>% spread(`Raw file`, `Retention time`)
+y_obs <- as.matrix(evid_ready %>% select(-Sequence))
+
+PEP_ready <- evid_concise %>% select(-`Retention time`,-`Peptide ID`) %>% distinct(Sequence, `Raw file`, .keep_all = TRUE) %>% spread(`Raw file`, PEP) %>% select(-Sequence)
+PEP_ready <- replace(PEP_ready,PEP_ready>=0.99,0.99)#There are abnormal values of PEP, as large as 17
+PEP <- as.matrix(PEP_ready)
+```
+
+
+# Simulation set up
+
+```{r parameters}
+n<-nrow(y_obs)
+p <- ncol(y_obs)
+num_it <- 25 # number of iteration
+degf <- 7 # parameter for spline fitting
+sd <- 0.1 # initial value for sd estimation
+resol <-25 # k value in knn
+radius <- 0.5 #Radius used in KNN
+step_size = 0.05 #stepsize for SGD
+```
+
+
+```{r preparation}
+
+set.seed(123)
+
+pep_sim<-PEP
+
+#mask is a matrix same size as original data with value 0 for missing and 1 for not missing.
+mask <- apply(!is.na(y_obs),2,as.numeric)
+```
+
+
+# Alignment Initialization
+
+```{r alignment 1 initialization}
+standardize <- function(x){
+  means = colMeans(x,na.rm = TRUE)
+  t((t(x)-means))
+}
+
+y_obs <- standardize(y_obs) #standardize the data ignoring missing values.
+comp <- imputePCA(y_obs, ncp = 1, scale = FALSE) #impute dataset with PCA
+y_obs <- replace_na(y_obs,0) #replace na values in data with 0 for easier calculation later.
+
+y_comp <- comp$completeObs # completed data after imputation
+
+# use the completed data for initiation (Calculate the first PC)
+svdx <- svd(y_comp)
+d<-svdx$v
+
+mask2 <- replace(mask, mask==0, NA) #replacing 0 with NA in mask and store the matrix in mask2, it will facilitate calculation later.
+
+
+# Plot the first PC
+ggplot(data=as.data.frame(y_obs))+geom_point(aes(x=y_obs[,1],y=y_obs[,2]))+geom_abline(intercept = 0, slope = d[2,1]/d[1,1]) 
+
+## projections of each point onto line
+proj1 <- y_comp%*%d[,1]%*%t(d[,1])
+y_plt <- y_obs*mask2
+
+# find the projected values of hidden variable a as the vector along the direction of first PC centered at mean.
+# scale the values from 0 to 1
+# that serve as a initial value for a 
+ak_initial<-function(fi,mu,d){
+  ak<-t(d)%*%(fi-mu)/(t(d)%*%d)
+  return(ak)
+}
+
+mu<-colMeans(y_comp)
+Fun<-proj1#n by p matrix representing fj(ak)
+a<-apply(Fun, 1, ak_initial, mu=mu,d=d[,1])
+
+
+a <- (a-min(a))/(max(a)-min(a))
+
+aini<-a
+alist<-list()
+
+pt.dat <- data.frame(y1=y_plt[,1],y2=y_plt[,2],a=a,f1=proj1[,1],f2=proj1[,2])
+ggplot(data = pt.dat)+geom_point(aes(x=a,y=y1), na.rm = TRUE)+geom_point(aes(x=a,y=f1,colour="red"))
+ggplot(data = pt.dat)+geom_point(aes(x=a,y=y2), na.rm = TRUE)+geom_point(aes(x=a,y=f2,colour="red"))
+
+sigmaj <- rep(sd^2,p)#initiation of sigma value.
+```
+
+
+```{r alignment 2 iteration with sparse array, echo=TRUE, cache=FALSE}
+Q<-function(a,fits,W,X,idx){#calculation of the part of Q value that is related with a, fits is a list of fits, W is weight array store as a jagged array. idx is a list of the index of observed value idx[[j]] is for j's experiement.
+  n=length(a)
+  p<-ncol(X)
+  Fun<-matrix(data = NA,nrow = n,ncol = p)
+  for (j in 1:p) {
+    Fun[,j]=predict(fits[[j]],a)$y
+  }
+  Qval<-0
+  for (j in 1:p) {
+    n_obsJ <- length(idx[[j]])
+    S=W[[j]]*(replicate(n_obsJ, X[idx[[j]],j])-t(replicate(n_obsJ,Fun[idx[[j]],j])))^2
+    sigmaj=sum(S,na.rm = TRUE)/sum(W[[j]])
+    Sigvec=rep(sigmaj,n_obsJ)
+    second_term<-sum(W[[j]]%*%log(Sigvec)/2)
+    Qval<-Qval+sum(S%*%(-1/Sigvec),na.rm = TRUE)/2-second_term
+  }
+  return(-Qval)
+}
+
+Jagged.Array <- function(dims){#function for create a jagged array with dimension value. Build
+  matrix(0, nrow = dims, ncol = dims)
+}
+obs.idx <- function(y){# function to find observed value's index
+  which(y!=0)
+}
+
+rev.idx <- function(y){#combined with apply function to create the reverse index matrix, where given position in the y_obs (real data), we can find out it's position without the missing value.
+
+#This matrix is used to fasten calculation
+  j=0
+  n_y = length(y)
+  idx = rep(0,n_y)
+  for (i in 1:n_y) {
+    if(y[i]!=0){
+      j=j+1
+      idx[i]=j
+    }
+  }
+  return(idx)
+}
+
+ptm <- proc.time()
+
+plot_dat <- cbind(Fun,rep(0,n),y_obs)
+u=0
+fits<-list() #list to store fitted spline objects
+n_obs <- colSums(y_obs!=0)
+idx_obs <- apply(y_obs,2,obs.idx)# observed value list
+idx_rev <- apply(y_obs,2,rev.idx)# reverse index matrix
+
+set.seed(123)
+idx_nn_all=list()
+largest_l <-0
+
+######################################################################################################################
+##code commented below is optional that can be further improve the speed, but can't improve the overall time complexity. This is the part that choose the knn points before iteration. Currently not using this. Instead, we choose different knn points in each iteration. Makes the fitting more robust###############################################################################
+######################################################################################################################
+# for (j in 1:p) {
+#     q1=0
+#     idx_nn <- nn2(y_obs[idx_obs[[j]],j],k=length(idx_obs[[j]]), searchtype = "radius",radius = radius)$nn.idx
+#     #idx_nn <- nn2(y_obs[idx_obs[[j]],j],k=resol)$nn.idx
+#     #idx_nn <- nn2(y_obs[idx_obs[[j]],j],k=n_obs[j])$nn.idx
+#     listj=list()
+#     for (i in idx_obs[[j]]) {
+#       q1=q1+1
+#       q2=0
+#       gyij<-0
+#       idx_nnj <- idx_obs[[j]][idx_nn[q1,]]
+#       l <- length(idx_nnj)
+#       if (l>largest_l){
+#         largest_l = l
+#       }
+#       if (l<resol){
+#         idx_nnj <- sort(idx_nnj)
+#       }else{
+#         idx_nnj <- sort(sample(idx_nnj,resol))
+#       }
+#       listj[[q1]]=idx_nnj
+#     }
+#     idx_nn_all[[j]]=listj
+# }
+
+
+w_cal_time <- c()
+spline_time <- c()
+Q_time <- c()
+W2<-lapply(n_obs, Jagged.Array)# weight array in forms of list of jagged array
+for (h in 1:num_it) {
+  # Qval0<-Qval1
+  ptm2<-proc.time()[1]
+  if(resol > min(n_obs)){
+    #Error!
+  }
+  for (j in 1:p) {
+    q1=0
+    # first find all points within the radius then if the number of points is larger than K, randomly choose k points.
+    idx_nn <- nn2(y_obs[idx_obs[[j]],j],k=length(idx_obs[[j]]), searchtype = "radius",radius = radius)$nn.idx
+    for (i in idx_obs[[j]]) {
+      q1=q1+1
+      q2=0
+      gyij<-0
+      #idx_nnj <- idx_nn_all[[j]][[q1]]
+      idx_nnj <- idx_obs[[j]][idx_nn[q1,]]
+      l <- length(idx_nnj)
+      if (l>largest_l){
+        largest_l = l
+      }
+      if (l<resol){
+        idx_nnj <- sort(idx_nnj)
+      }else{
+        idx_nnj <- sort(sample(idx_nnj,resol))
+      }
+      
+      
+      if(length(idx_nnj)==1){# if no points within that radius weight is just 1-PEP, no update for it.
+        q2= idx_rev[idx_nnj,j]
+        W2[[j]][q1,q2]=1-pep_sim[i,j]
+      }else{
+        for (k1 in idx_nnj) {#calculate denominator
+        if (k1 == i)
+        {
+          gyij<-gyij+dnorm(y_obs[i,j],Fun[k1,j],sd = sqrt(sigmaj[j]))*(1-pep_sim[i,j])
+        }else{
+          gyij<-gyij+dnorm(y_obs[i,j],Fun[k1,j],sd = sqrt(sigmaj[j]))*pep_sim[i,j]/(length(idx_nnj)-1)
+        }
+        
+        }
+        
+        for (k in idx_nnj) {
+          q2=idx_rev[k,j]
+          loggyijak<-log(dnorm(y_obs[i,j],mean = Fun[k,j],sd = sqrt(sigmaj[j])))
+          if (k == i)
+          {
+            W2[[j]][q1,q2]=exp(loggyijak-log(gyij)+log(1-pep_sim[i,j]))
+          }else{
+            W2[[j]][q1,q2]=exp(loggyijak-log(gyij)+log(pep_sim[i,j]/(length(idx_nnj)-1)))
+          }
+          if (is.na(W2[[j]][q1,q2]))# a debug line of code
+            stop()
+        }
+      }
+
+    }
+  }
+  w_cal_time = c(w_cal_time,proc.time()[1]-ptm2)
+  # if(h!=1){# this part should be the SGD part
+  #   a<-nlm(f=Q, p=a, fits=fits, W=W2, X=y_obs, idx=idx_obs,iterlim = 1)$estimate
+  # }
+  Q_time = c(Q_time, proc.time()[1]-ptm2)
+  a2<-max(a)
+  a1<-min(a)
+  # following is spline part
+  weights<-lapply(W2, colSums)
+  for (j in 1:p) {
+    weightsJ<- replace(weights[[j]], weights[[j]]<10^(-8), 10^(-8))
+    Dmtx<-diag(1/weightsJ)#it's the inverse of D
+    WJ <- t(W2[[j]])
+    ybar<-WJ%*%y_obs[idx_obs[[j]],j]
+    yvalue<-Dmtx%*%ybar
+    xvalue<-a[idx_obs[[j]]]
+    fit <- smooth.spline(x=xvalue, y=yvalue, w=weightsJ, df=degf)##fixed df because as iteration goes on the fit will be interplotation.
+    Fun[,j]=predict(fit,a)$y
+    n_obsJ <- length(idx_obs[[j]])
+    S=W2[[j]]*(replicate(n_obsJ, y_obs[idx_obs[[j]],j])-t(replicate(n_obsJ,Fun[idx_obs[[j]],j])))^2
+    sigmaj[j]=sum(S,na.rm = TRUE)/sum(W2[[j]])
+    fits[[j]]=fit
+  }
+  spline_time = c(spline_time, proc.time()[1]-ptm2)
+  u<-u+1
+  
+  pt.dat <- data.frame(y1=y_plt[,1],y2=y_plt[,2],s=a,f1=Fun[,1],f2=Fun[,2])
+  p1<-ggplot(data = pt.dat)+geom_point(aes(x=s,y=y1), na.rm = TRUE)+geom_point(aes(x=s,y=f1,colour="red"))
+  a<-(a-a1)/(a2-a1)
+  alist[[h]]<-a
+}
+cat("code running time is:")
+proc.time()-ptm
+
+
+ggplot(data=pt.dat)+geom_point(aes(x=y1,y=y2),na.rm = TRUE)+geom_point(aes(x=f1,y=f2,colour="red"))
+print(p1)
+
+sigmaj
+```
+
+```{r computing time analysis}
+spline_time <-spline_time-Q_time
+Q_time <- Q_time-w_cal_time
+w_cal_time
+
+Q_time
+spline_time
+```
+
+
+```{r using fitted spline to caculate weights, cache=TRUE}
+#calculate weights based on the fitted spline and all data.
+ptm <- proc.time()
+for (j in 1:p) {
+    q1=0
+    for (i in idx_obs[[j]]) {
+      q1=q1+1
+      q2=0
+      gyij<-0
+      for (k1 in idx_obs[[j]]) {
+        if (k1 == i)
+        {
+          gyij<-gyij+dnorm(y_obs[i,j],Fun[k1,j],sd = sqrt(sigmaj[j]))*(1-pep_sim[i,j])
+        }else{
+          gyij<-gyij+dnorm(y_obs[i,j],Fun[k1,j],sd = sqrt(sigmaj[j]))*pep_sim[i,j]/(length(idx_obs[[j]])-1)
+        }
+      }
+      for (k in idx_obs[[j]]) {
+        q2=q2+1
+        loggyijak<-log(dnorm(y_obs[i,j],mean = Fun[k,j],sd = sqrt(sigmaj[j])))
+        if (k == i)
+        {
+          W2[[j]][q1,q2]=exp(loggyijak-log(gyij)+log(1-pep_sim[i,j]))
+        }else{
+          W2[[j]][q1,q2]=exp(loggyijak-log(gyij)+log(pep_sim[i,j]/(length(idx_obs[[j]])-1)))
+        }
+      }
+    }
+}
+
+proc.time()-ptm
+```
+
+
+```{r analysis: comparison, echo=TRUE}
+updated_true <- matrix(NA, nrow = n, ncol = p)
+mtx_updated <- matrix(NA, nrow = n, ncol = p)
+for (j in 1:p) {
+  q1<-0
+  for (i in idx_obs[[j]]) {
+    q1=q1+1
+    mtx_updated[i,j] <- max(W2[[j]][q1,])
+  }
+}
+
+mtx_updated_true_pep <- (1-updated_true)*mask2
+mtx_updated_pep <- (1-mtx_updated)*mask2
+
+
+num_1 <- sum(as.numeric(PEP*mask2<0.01),na.rm = TRUE)# number of PEP<0.01 before update
+num_3 <- sum(as.numeric(mtx_updated_pep<0.01), na.rm = TRUE)# number of PEP<0.01 after update
+num_1
+num_3
+
+(num_3-num_1)/num_1
+```
+
+
+
+
+
+
+
+
+
+
